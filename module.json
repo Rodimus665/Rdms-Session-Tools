@@ -1,0 +1,385 @@
+/*
+ * Jared's Session To-Dos
+ * Private Foundry VTT v14 module.
+ */
+
+const JST_MODULE_ID = "jared-session-todos";
+const JST_DATA_SETTING = "todoData";
+const JST_POSITION_SETTING = "widgetPosition";
+
+const JST_DEFAULT_DATA = {
+  items: [
+    {
+      id: foundry.utils.randomID(),
+      title: "Opening recap",
+      details: "Remind players where they are, what is urgent, and what changed since last session.",
+      done: false
+    },
+    {
+      id: foundry.utils.randomID(),
+      title: "Main scene or encounter",
+      details: "Key NPCs, clues, stakes, complications, or combat beats to cover.",
+      done: false
+    },
+    {
+      id: foundry.utils.randomID(),
+      title: "Session end hook",
+      details: "A reveal, choice, cliffhanger, or next-session setup.",
+      done: false
+    }
+  ]
+};
+
+let jstWidget = null;
+let jstEditor = null;
+
+function jstClone(data) {
+  return foundry.utils.deepClone(data ?? { items: [] });
+}
+
+function jstData() {
+  const data = game.settings.get(JST_MODULE_ID, JST_DATA_SETTING);
+  if (!data || !Array.isArray(data.items)) return jstClone(JST_DEFAULT_DATA);
+  return jstClone(data);
+}
+
+async function jstSaveData(data) {
+  data.items = (data.items ?? []).map(item => ({
+    id: item.id || foundry.utils.randomID(),
+    title: String(item.title ?? "Untitled item").trim() || "Untitled item",
+    details: String(item.details ?? ""),
+    done: Boolean(item.done)
+  }));
+  await game.settings.set(JST_MODULE_ID, JST_DATA_SETTING, data);
+  jstWidget?.render();
+}
+
+function jstEscape(value) {
+  const div = document.createElement("div");
+  div.textContent = String(value ?? "");
+  return div.innerHTML;
+}
+
+class JaredSessionTodoWidget {
+  constructor() {
+    this.element = null;
+  }
+
+  render() {
+    const data = jstData();
+    const pos = game.settings.get(JST_MODULE_ID, JST_POSITION_SETTING) ?? { top: 120, left: 120 };
+
+    if (!this.element) {
+      this.element = document.createElement("section");
+      this.element.id = "jst-widget";
+      document.body.appendChild(this.element);
+    }
+
+    const remaining = data.items.filter(item => !item.done).length;
+    const itemsHtml = data.items.length
+      ? data.items.map(item => `
+        <li class="jst-widget-item ${item.done ? "jst-done" : ""}" data-id="${item.id}">
+          <label>
+            <input type="checkbox" ${item.done ? "checked" : ""}>
+            <span>${jstEscape(item.title)}</span>
+          </label>
+        </li>`).join("")
+      : `<li class="jst-empty">No session items yet.</li>`;
+
+    this.element.innerHTML = `
+      <header class="jst-widget-header">
+        <div>
+          <strong>Session To-Dos</strong>
+          <small>${remaining} remaining</small>
+        </div>
+        <button type="button" class="jst-icon-button" data-action="collapse" title="Collapse or expand">−</button>
+      </header>
+      <div class="jst-widget-body">
+        <ul>${itemsHtml}</ul>
+        <footer>
+          <button type="button" data-action="editor">Edit</button>
+          <button type="button" data-action="reset-done">Clear Ticks</button>
+        </footer>
+      </div>
+    `;
+
+    this.element.style.top = `${Number(pos.top) || 120}px`;
+    this.element.style.left = `${Number(pos.left) || 120}px`;
+
+    this.activateListeners();
+  }
+
+  activateListeners() {
+    const header = this.element.querySelector(".jst-widget-header");
+    header.addEventListener("mousedown", event => this.startDrag(event));
+
+    this.element.querySelectorAll("input[type='checkbox']").forEach(input => {
+      input.addEventListener("change", async event => {
+        const li = event.currentTarget.closest("li[data-id]");
+        const data = jstData();
+        const item = data.items.find(i => i.id === li.dataset.id);
+        if (item) item.done = event.currentTarget.checked;
+        await jstSaveData(data);
+        jstEditor?.render();
+      });
+    });
+
+    this.element.querySelector("[data-action='editor']")?.addEventListener("click", () => jstOpenEditor());
+
+    this.element.querySelector("[data-action='collapse']")?.addEventListener("click", event => {
+      event.stopPropagation();
+      this.element.classList.toggle("jst-collapsed");
+      event.currentTarget.textContent = this.element.classList.contains("jst-collapsed") ? "+" : "−";
+    });
+
+    this.element.querySelector("[data-action='reset-done']")?.addEventListener("click", async () => {
+      const data = jstData();
+      data.items.forEach(item => item.done = false);
+      await jstSaveData(data);
+      jstEditor?.render();
+    });
+  }
+
+  startDrag(event) {
+    if (event.target.closest("button")) return;
+    event.preventDefault();
+
+    const rect = this.element.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+
+    const move = event => {
+      const left = Math.max(0, Math.min(window.innerWidth - 80, event.clientX - offsetX));
+      const top = Math.max(0, Math.min(window.innerHeight - 40, event.clientY - offsetY));
+      this.element.style.left = `${left}px`;
+      this.element.style.top = `${top}px`;
+    };
+
+    const up = async () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      const rect = this.element.getBoundingClientRect();
+      await game.settings.set(JST_MODULE_ID, JST_POSITION_SETTING, {
+        left: Math.round(rect.left),
+        top: Math.round(rect.top)
+      });
+    };
+
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  }
+}
+
+class JaredSessionTodoEditor {
+  constructor() {
+    this.element = null;
+    this.expanded = new Set();
+  }
+
+  render() {
+    const data = jstData();
+
+    if (!this.element) {
+      this.element = document.createElement("section");
+      this.element.id = "jst-editor";
+      document.body.appendChild(this.element);
+    }
+
+    const itemsHtml = data.items.map((item, index) => {
+      const expanded = this.expanded.has(item.id);
+      return `
+        <article class="jst-editor-item ${item.done ? "jst-done" : ""}" data-id="${item.id}">
+          <div class="jst-editor-row">
+            <input type="checkbox" class="jst-editor-done" ${item.done ? "checked" : ""} title="Mark complete">
+            <button type="button" class="jst-expand-button" data-action="expand">${expanded ? "▾" : "▸"}</button>
+            <input type="text" class="jst-title-input" value="${jstEscape(item.title)}" placeholder="To-do item">
+            <button type="button" data-action="up" ${index === 0 ? "disabled" : ""}>▲</button>
+            <button type="button" data-action="down" ${index === data.items.length - 1 ? "disabled" : ""}>▼</button>
+            <button type="button" data-action="delete">Delete</button>
+          </div>
+          <div class="jst-details-wrap" style="display:${expanded ? "block" : "none"}">
+            <textarea class="jst-details-input" placeholder="Expanded notes, NPC beats, clues, boxed-text reminders, contingencies...">${jstEscape(item.details)}</textarea>
+          </div>
+        </article>`;
+    }).join("");
+
+    this.element.innerHTML = `
+      <header class="jst-editor-header">
+        <div>
+          <h2>Session To-Do Editor</h2>
+          <p>Keep the widget short, then expand each item here for details.</p>
+        </div>
+        <button type="button" class="jst-icon-button" data-action="close">×</button>
+      </header>
+      <main class="jst-editor-main">
+        ${itemsHtml || `<p class="jst-empty-editor">No items yet. Add one below.</p>`}
+      </main>
+      <footer class="jst-editor-footer">
+        <button type="button" data-action="add">Add Item</button>
+        <button type="button" data-action="save">Save</button>
+      </footer>
+    `;
+
+    this.activateListeners();
+  }
+
+  close() {
+    this.element?.remove();
+    this.element = null;
+  }
+
+  collect() {
+    const items = Array.from(this.element.querySelectorAll(".jst-editor-item")).map(article => ({
+      id: article.dataset.id,
+      title: article.querySelector(".jst-title-input")?.value ?? "Untitled item",
+      details: article.querySelector(".jst-details-input")?.value ?? "",
+      done: article.querySelector(".jst-editor-done")?.checked ?? false
+    }));
+    return { items };
+  }
+
+  activateListeners() {
+    this.element.querySelector("[data-action='close']")?.addEventListener("click", () => this.close());
+
+    this.element.querySelector("[data-action='save']")?.addEventListener("click", async () => {
+      await jstSaveData(this.collect());
+      ui.notifications?.info("Session to-dos saved.");
+      this.render();
+    });
+
+    this.element.querySelector("[data-action='add']")?.addEventListener("click", async () => {
+      const data = this.collect();
+      const id = foundry.utils.randomID();
+      data.items.push({ id, title: "New session item", details: "", done: false });
+      this.expanded.add(id);
+      await jstSaveData(data);
+      this.render();
+    });
+
+    this.element.querySelectorAll("[data-action='expand']").forEach(button => {
+      button.addEventListener("click", event => {
+        const article = event.currentTarget.closest(".jst-editor-item");
+        if (this.expanded.has(article.dataset.id)) this.expanded.delete(article.dataset.id);
+        else this.expanded.add(article.dataset.id);
+        this.render();
+      });
+    });
+
+    this.element.querySelectorAll("[data-action='delete']").forEach(button => {
+      button.addEventListener("click", async event => {
+        const article = event.currentTarget.closest(".jst-editor-item");
+        const data = this.collect();
+        data.items = data.items.filter(item => item.id !== article.dataset.id);
+        this.expanded.delete(article.dataset.id);
+        await jstSaveData(data);
+        this.render();
+      });
+    });
+
+    this.element.querySelectorAll("[data-action='up'], [data-action='down']").forEach(button => {
+      button.addEventListener("click", async event => {
+        const article = event.currentTarget.closest(".jst-editor-item");
+        const data = this.collect();
+        const index = data.items.findIndex(item => item.id === article.dataset.id);
+        const direction = event.currentTarget.dataset.action === "up" ? -1 : 1;
+        const target = index + direction;
+        if (target < 0 || target >= data.items.length) return;
+        [data.items[index], data.items[target]] = [data.items[target], data.items[index]];
+        await jstSaveData(data);
+        this.render();
+      });
+    });
+
+    this.element.querySelectorAll(".jst-title-input, .jst-details-input, .jst-editor-done").forEach(input => {
+      input.addEventListener("change", async () => {
+        await jstSaveData(this.collect());
+      });
+    });
+  }
+}
+
+function jstOpenEditor() {
+  if (!jstEditor) jstEditor = new JaredSessionTodoEditor();
+  jstEditor.render();
+}
+
+function jstAddSidebarButton() {
+  if (document.getElementById("jst-scene-control-button")) return;
+
+  const controls = document.getElementById("controls") || document.querySelector("#ui-left");
+  if (!controls) return;
+
+  const button = document.createElement("button");
+  button.id = "jst-scene-control-button";
+  button.type = "button";
+  button.title = "Open Session To-Dos";
+  button.innerHTML = `<i class="fas fa-list-check"></i>`;
+  button.addEventListener("click", () => {
+    jstWidget?.render();
+    jstOpenEditor();
+  });
+
+  controls.appendChild(button);
+}
+
+Hooks.once("init", () => {
+  game.settings.register(JST_MODULE_ID, JST_DATA_SETTING, {
+    name: "Session To-Do Data",
+    hint: "Stores the current world session to-do list.",
+    scope: "world",
+    config: false,
+    type: Object,
+    default: JST_DEFAULT_DATA
+  });
+
+  game.settings.register(JST_MODULE_ID, JST_POSITION_SETTING, {
+    name: "Session To-Do Widget Position",
+    hint: "Stores the floating widget position.",
+    scope: "client",
+    config: false,
+    type: Object,
+    default: { top: 120, left: 120 }
+  });
+
+  game.settings.registerMenu(JST_MODULE_ID, "openEditor", {
+    name: "Open Session To-Do Editor",
+    label: "Open Editor",
+    hint: "Open the expanded session to-do editor.",
+    icon: "fas fa-list-check",
+    type: class extends FormApplication {
+      static get defaultOptions() {
+        return foundry.utils.mergeObject(super.defaultOptions, {
+          id: "jst-settings-launcher",
+          title: "Session To-Dos",
+          template: "templates/apps/blank.html",
+          width: 1,
+          height: 1
+        });
+      }
+      render(force, options) {
+        jstOpenEditor();
+        return this;
+      }
+    },
+    restricted: false
+  });
+
+  game.keybindings.register(JST_MODULE_ID, "toggleEditor", {
+    name: "Open Session To-Do Editor",
+    hint: "Open the expanded editor for Jared's Session To-Dos.",
+    editable: [{ key: "KeyT", modifiers: ["Control", "Shift"] }],
+    onDown: () => {
+      jstOpenEditor();
+      return true;
+    },
+    restricted: false
+  });
+});
+
+Hooks.once("ready", () => {
+  jstWidget = new JaredSessionTodoWidget();
+  jstWidget.render();
+  jstAddSidebarButton();
+});
+
+Hooks.on("renderSceneControls", () => jstAddSidebarButton());
